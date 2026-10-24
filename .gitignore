@@ -1,0 +1,23 @@
+# Environment & Secrets
+.env
+credentials/*.json
+!credentials/.gitkeep
+token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# Output & Cache
+output/*
+!output/.gitkeep
+temp/
+assets/temp/*
+
+# OS
+.DS_Store
+Thumbs.db
