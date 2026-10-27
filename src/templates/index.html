@@ -256,7 +256,8 @@
   }
 
   function generateAllPortraits() {
-    return pool(script.characters.map((_, i) => () => generatePortrait(i)));
+    // One at a time: Google's per-minute image quota is low
+    return pool(script.characters.map((_, i) => () => generatePortrait(i)), 1);
   }
   $("allPortraits").onclick = generateAllPortraits;
 
@@ -367,7 +368,7 @@
   }
 
   $("allScenes").onclick = () => pool(
-    script.scenes.map((_, i) => i).filter(i => !scenes[i].source).map(i => () => generateScene(i))
+    script.scenes.map((_, i) => i).filter(i => !scenes[i].source).map(i => () => generateScene(i)), 1
   );
 
   $("copyAll").onclick = e => copy(

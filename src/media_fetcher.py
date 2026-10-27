@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import requests
@@ -16,6 +18,27 @@ OMNI_TIMEOUT_SECONDS = 600
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
+
+
+_IMAGE_LOCK = threading.Lock()
+RATE_LIMIT_WAITS = (15, 30, 60)  # seconds between retries after a 429
+
+
+def _is_rate_limited(err: Exception) -> bool:
+    text = str(err)
+    return "429" in text or "RESOURCE_EXHAUSTED" in text
+
+
+def _retry_on_rate_limit(call):
+    """Runs call(), waiting and retrying when Google answers 429 / RESOURCE_EXHAUSTED."""
+    for wait in RATE_LIMIT_WAITS + (None,):
+        try:
+            return call()
+        except Exception as e:
+            if wait is None or not _is_rate_limited(e):
+                raise
+            logger.info(f"Rate limited by Google; retrying in {wait}s...")
+            time.sleep(wait)
 
 
 def _image_mime(path: Path) -> str:
@@ -154,14 +177,17 @@ class MediaFetcher:
             else:
                 contents.append(prompt)
 
-            response = client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    response_modalities=["IMAGE"],
-                    image_config=types.ImageConfig(aspect_ratio="9:16"),
-                ),
-            )
+            # One image request at a time per server, retrying on rate limits: the per-minute
+            # image quota is low, so parallel portrait/scene requests otherwise hit 429s
+            with _IMAGE_LOCK:
+                response = _retry_on_rate_limit(lambda: client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["IMAGE"],
+                        image_config=types.ImageConfig(aspect_ratio="9:16"),
+                    ),
+                ))
             for part in response.candidates[0].content.parts:
                 if part.inline_data and part.inline_data.data:
                     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -301,7 +327,13 @@ class MediaFetcher:
         try:
             mode = f"animating {start_image.name}" if start_image else "text-to-video"
             logger.info(f"Calling Veo ({model_name}, {mode}) for: '{prompt[:50]}...'")
-            r = requests.post(f"{base}:predictLongRunning", params=params, json=body, timeout=60)
+            def start():
+                resp = requests.post(f"{base}:predictLongRunning", params=params, json=body, timeout=60)
+                if resp.status_code == 429:
+                    raise RuntimeError(f"429 RESOURCE_EXHAUSTED: {resp.text[:200]}")
+                return resp
+
+            r = _retry_on_rate_limit(start)
             if not r.ok:
                 logger.warning(f"Veo request rejected ({r.status_code}): {r.text[:300]}")
                 return False
