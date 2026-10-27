@@ -3,11 +3,11 @@ import logging
 import os
 import subprocess
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 import requests
 
 import config
-from src.script_generator import ScenePrompt
+from src.script_generator import Character, ScenePrompt
 
 logger = logging.getLogger("ParableTales.MediaFetcher")
 
@@ -16,6 +16,11 @@ OMNI_TIMEOUT_SECONDS = 600
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
+
+
+def _image_mime(path: Path) -> str:
+    ext = path.suffix.lower()
+    return {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(ext, "image/png")
 
 
 class MediaFetcher:
@@ -74,9 +79,9 @@ class MediaFetcher:
         try:
             import time
             import base64
-            from google import genai
+            from src.genai_client import make_client
 
-            client = genai.Client(api_key=config.GEMINI_API_KEY)
+            client = make_client()
             logger.info(f"Calling Google Omni Model ({model_name}) for: '{prompt[:50]}...'")
 
             # Omni only supports the Interactions API. Run in background mode and poll,
@@ -118,24 +123,40 @@ class MediaFetcher:
         self,
         prompt: str,
         output_path: Path,
-        model_name: str = config.IMAGE_MODEL
+        model_name: str = config.IMAGE_MODEL,
+        references: Optional[List[Tuple[str, Path]]] = None
     ) -> bool:
         """
         Generates a single 9:16 still frame for a scene using a Gemini Flash image model.
+        references: (character name, portrait path) pairs passed as input images so the
+        characters keep the same face, hair and clothing as their portraits.
         """
         if not config.GEMINI_API_KEY:
             return False
 
         try:
-            from google import genai
+            from src.genai_client import make_client
             from google.genai import types
 
-            client = genai.Client(api_key=config.GEMINI_API_KEY)
+            client = make_client()
             logger.info(f"Calling Gemini image model ({model_name}) for: '{prompt[:50]}...'")
+
+            contents: list = []
+            if references:
+                for name, path in references:
+                    contents.append(types.Part.from_bytes(data=path.read_bytes(), mime_type=_image_mime(path)))
+                labels = ", ".join(f"reference image {i} is {name}" for i, (name, _) in enumerate(references, 1))
+                contents.append(
+                    f"The reference images are character portraits: {labels}. Draw these exact characters: "
+                    "keep each one's face, hair, build, skin tone and clothing identical to their reference. "
+                    "Do not copy the portraits' poses or plain backgrounds. Scene: " + prompt
+                )
+            else:
+                contents.append(prompt)
 
             response = client.models.generate_content(
                 model=model_name,
-                contents=prompt,
+                contents=contents,
                 config=types.GenerateContentConfig(
                     response_modalities=["IMAGE"],
                     image_config=types.ImageConfig(aspect_ratio="9:16"),
@@ -153,6 +174,40 @@ class MediaFetcher:
             logger.warning(f"Gemini image generation unavailable: {e}")
 
         return False
+
+    def generate_character_portrait(self, character: Character, style: str, output_path: Path) -> bool:
+        """Full-body reference portrait of a character, used to keep them consistent across scenes."""
+        prompt = (
+            f"Character reference portrait of {character.name}: {character.description}. "
+            "Full body, standing, facing the camera, neutral expression, plain light-grey studio background, "
+            f"even lighting, the whole outfit clearly visible, {config.visual_injection(style)}"
+        )
+        return self.generate_image_with_gemini(prompt, output_path)
+
+    def generate_scene_image(
+        self,
+        scene: ScenePrompt,
+        output_path: Path,
+        portraits: Optional[Dict[str, Path]] = None
+    ) -> bool:
+        """Scene still from its prompt, using the portraits of the characters in it as references."""
+        portraits = portraits or {}
+        refs = [(name, portraits[name]) for name in scene.characters if name in portraits and portraits[name].exists()]
+        return self.generate_image_with_gemini(scene.final_visual_prompt, output_path, references=refs[:3])
+
+    def generate_character_portraits(
+        self,
+        characters: List[Character],
+        style: str,
+        output_dir: Path
+    ) -> Dict[str, Path]:
+        """Generates a portrait per character; returns name -> path for the ones that succeeded."""
+        portraits = {}
+        for i, c in enumerate(characters, start=1):
+            path = output_dir / f"character_{i:02d}.png"
+            if self.generate_character_portrait(c, style, path):
+                portraits[c.name] = path
+        return portraits
 
     def animate_image_to_clip(
         self,
@@ -199,9 +254,87 @@ class MediaFetcher:
             logger.warning(f"Failed to animate image {image_path.name}: {e.stderr.decode(errors='ignore')[-500:]}")
             return False
 
-    def generate_clip_with_veo(self, prompt: str, output_path: Path) -> bool:
-        """Backward-compatible alias pointing to Omni video generation."""
-        return self.generate_clip_with_omni(prompt, output_path)
+    def generate_clip_with_veo(
+        self,
+        prompt: str,
+        output_path: Path,
+        model_name: str = config.VEO_MODEL,
+        start_image: Optional[Path] = None
+    ) -> bool:
+        """
+        Generates an 8s 9:16 clip with Veo on the Google Cloud agent platform (Vertex AI).
+        start_image: animate this still (image-to-video) so the clip keeps its characters.
+        Calls REST directly: with an express-mode API key the SDK's generate_videos omits the
+        project from the path and fails with RESOURCE_PROJECT_INVALID.
+        Veo's own audio is off; the pipeline adds the voiceover.
+        """
+        if not (config.GEMINI_USE_VERTEX and config.GOOGLE_CLOUD_PROJECT):
+            logger.warning("Veo needs GEMINI_USE_VERTEX=1 and GOOGLE_CLOUD_PROJECT set in .env")
+            return False
+
+        import base64
+        import time
+
+        loc = config.GOOGLE_CLOUD_LOCATION
+        base = (
+            f"https://{loc}-aiplatform.googleapis.com/v1/projects/{config.GOOGLE_CLOUD_PROJECT}"
+            f"/locations/{loc}/publishers/google/models/{model_name}"
+        )
+        params = {"key": config.GEMINI_API_KEY}
+        instance = {"prompt": prompt}
+        if start_image:
+            instance["image"] = {
+                "bytesBase64Encoded": base64.b64encode(start_image.read_bytes()).decode(),
+                "mimeType": _image_mime(start_image),
+            }
+        body = {
+            "instances": [instance],
+            "parameters": {
+                "aspectRatio": "9:16",
+                "durationSeconds": 8,  # Veo max; the composer loops clips to fit longer scenes
+                "resolution": "720p",
+                "generateAudio": False,
+                "sampleCount": 1,
+            },
+        }
+
+        try:
+            mode = f"animating {start_image.name}" if start_image else "text-to-video"
+            logger.info(f"Calling Veo ({model_name}, {mode}) for: '{prompt[:50]}...'")
+            r = requests.post(f"{base}:predictLongRunning", params=params, json=body, timeout=60)
+            if not r.ok:
+                logger.warning(f"Veo request rejected ({r.status_code}): {r.text[:300]}")
+                return False
+            op_name = r.json()["name"]
+
+            deadline = time.time() + OMNI_TIMEOUT_SECONDS
+            while time.time() < deadline:
+                time.sleep(10)
+                status = requests.post(
+                    f"{base}:fetchPredictOperation", params=params,
+                    json={"operationName": op_name}, timeout=60
+                ).json()
+                if not status.get("done"):
+                    continue
+                if "error" in status:
+                    logger.warning(f"Veo generation failed: {status['error']}")
+                    return False
+                videos = status.get("response", {}).get("videos", [])
+                if not videos or not videos[0].get("bytesBase64Encoded"):
+                    filtered = status.get("response", {}).get("raiMediaFilteredCount", 0)
+                    logger.warning(f"Veo returned no video (safety-filtered: {filtered}). Try rewording the prompt.")
+                    return False
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(output_path, "wb") as f:
+                    f.write(base64.b64decode(videos[0]["bytesBase64Encoded"]))
+                logger.info(f"✅ Veo video clip saved to {output_path.name}")
+                return True
+
+            logger.warning(f"Veo generation timed out after {OMNI_TIMEOUT_SECONDS}s")
+        except Exception as e:
+            logger.warning(f"Veo generation unavailable: {e}")
+
+        return False
 
     def fetch_clip_from_pexels(self, query: str, output_path: Path, min_duration: float = 8.0) -> bool:
         """Downloads a vertical HD video clip from Pexels matching the query."""
@@ -296,19 +429,24 @@ class MediaFetcher:
         use_omni: bool = False,
         use_veo: bool = False,
         use_images: bool = False,
-        scene_assets: Optional[List[Path]] = None
+        scene_assets: Optional[List[Path]] = None,
+        scene_veo: Optional[List[bool]] = None,
+        portraits: Optional[Dict[str, Path]] = None
     ) -> List[Path]:
         """
         Gathers or generates an 8-second video clip for every scene in the payload.
-        If scene_assets (user-uploaded images/videos, in order) is given, those are used
-        exclusively, cycling if the script has more scenes than files.
+        If scene_assets (images/videos per scene, in order) is given, those are used
+        exclusively, cycling if the script has more scenes than files. scene_veo[i] = True
+        animates that scene's image with Veo (image-to-video) instead of a slow zoom.
         Otherwise, priority:
         1. Local pre-rendered AI clip in `assets/scenes/scene_{n}.mp4`
         2. Local still image in `assets/scenes/scene_{n}.png/.jpg` (animated with Ken Burns zoom)
-        3. Google Omni Model generation (if use_omni=True and GEMINI_API_KEY is active)
-        4. Gemini Flash image + Ken Burns zoom (if use_images=True)
-        5. Pexels Stock API search
-        6. Procedural cinematic backdrop
+        3. Veo generation (if use_veo=True; animates a portrait-consistent scene image when
+           character portraits are given)
+        4. Google Omni Model generation (if use_omni=True and GEMINI_API_KEY is active)
+        5. Gemini Flash image (using character portraits) + Ken Burns zoom (if use_images=True)
+        6. Pexels Stock API search
+        7. Procedural cinematic backdrop
         """
         output_dir.mkdir(parents=True, exist_ok=True)
         clip_paths = []
@@ -321,9 +459,14 @@ class MediaFetcher:
                     clip_paths.append(asset)
                     continue
                 scene_file = output_dir / f"scene_{s.scene_number:02d}.mp4"
+                if scene_veo and i < len(scene_veo) and scene_veo[i]:
+                    if self.generate_clip_with_veo(s.final_visual_prompt, scene_file, start_image=asset):
+                        clip_paths.append(scene_file)
+                        continue
+                    logger.warning(f"Veo failed for scene {s.scene_number}; using a slow zoom of its image instead")
                 zoom_in = s.scene_number % 2 == 1
                 if not self.animate_image_to_clip(asset, scene_file, s.duration_seconds, zoom_in):
-                    raise RuntimeError(f"Could not process uploaded image '{asset.name}'")
+                    raise RuntimeError(f"Could not process image '{asset.name}' for scene {s.scene_number}")
                 clip_paths.append(scene_file)
             return clip_paths
 
@@ -348,14 +491,24 @@ class MediaFetcher:
                 logger.info(f"Using local still image: {local_image}")
                 acquired = self.animate_image_to_clip(local_image, scene_file, s.duration_seconds, zoom_in)
 
-            # Try Google Omni Model if requested (or backward-compatible use_veo)
-            if not acquired and (use_omni or use_veo):
+            # Try Veo (Google Cloud agent platform) if requested. With character portraits,
+            # first make a consistent scene image and animate that.
+            if not acquired and use_veo:
+                start_image = None
+                if portraits:
+                    image_file = output_dir / f"scene_{s.scene_number:02d}.png"
+                    if self.generate_scene_image(s, image_file, portraits):
+                        start_image = image_file
+                acquired = self.generate_clip_with_veo(s.final_visual_prompt, scene_file, start_image=start_image)
+
+            # Try Google Omni Model if requested
+            if not acquired and use_omni:
                 acquired = self.generate_clip_with_omni(s.final_visual_prompt, scene_file)
 
             # Try Gemini Flash still image, animated into a clip
             if not acquired and use_images:
                 image_file = output_dir / f"scene_{s.scene_number:02d}.png"
-                if self.generate_image_with_gemini(s.final_visual_prompt, image_file):
+                if self.generate_scene_image(s, image_file, portraits):
                     acquired = self.animate_image_to_clip(image_file, scene_file, s.duration_seconds, zoom_in)
 
             # Try Pexels if Veo was not used or failed

@@ -15,9 +15,33 @@ NICHE_DESCRIPTION = "3D Cinematic Bible Story Animation & Comedy"
 # Strict Pacing Constraint: Stacked 8-second AI video clips
 CLIP_DURATION_SECONDS = 8.0
 
-# Visual Prompt Injection
-# Automatically appended to every scene prompt sent to video generation APIs
-VISUAL_PROMPT_INJECTION = "3D cinematic comic style. No one is speaking; mouths are completely closed"
+# Visual styles a creator can pick per episode. The style's prompt is appended to every
+# scene prompt sent to image/video generators, followed by the closed-mouth constraint.
+VISUAL_STYLES = {
+    "3d": {
+        "label": "3D animated",
+        "prompt": "3D animated movie style, Pixar-quality CGI render, cinematic lighting",
+    },
+    "realistic": {
+        "label": "Realistic",
+        "prompt": "Photorealistic cinematic live-action style, natural lighting, realistic skin and textures, shot on 35mm film",
+    },
+    "cartoon": {
+        "label": "Cartoon",
+        "prompt": "2D cartoon illustration style, bold clean outlines, vibrant flat colors",
+    },
+}
+DEFAULT_VISUAL_STYLE = os.getenv("VISUAL_STYLE", "3d")
+MOUTHS_CLOSED = "No one is speaking; mouths are completely closed"
+
+
+def visual_injection(style: str = DEFAULT_VISUAL_STYLE) -> str:
+    """Suffix appended to every scene prompt for the given style key."""
+    return f"{VISUAL_STYLES.get(style, VISUAL_STYLES['3d'])['prompt']}. {MOUTHS_CLOSED}"
+
+
+# Default injection (kept for callers that don't pick a style)
+VISUAL_PROMPT_INJECTION = visual_injection()
 
 # Default YouTube Tag Payload
 BASE_TAGS = [
@@ -47,11 +71,30 @@ DEFAULT_VOICE = os.getenv("TTS_VOICE", "en-US-ChristopherNeural")
 # Default: Google's native multimodal Omni model 'gemini-omni-1.1-flash'
 VIDEO_MODEL = os.getenv("VIDEO_MODEL", "gemini-omni-1.1-flash")
 
+# Script-writing models, tried in order until one succeeds (comma-separated in .env).
+# Free-tier models are often rate-limited (429) or overloaded (503), so keep several.
+# (The "-latest" aliases only exist on AI Studio, not on the Google Cloud agent platform.)
+_DEFAULT_SCRIPT_MODELS = (
+    "gemini-3.8-flash,gemini-3.5-flash,gemini-3.5-flash-lite"
+    if os.getenv("GEMINI_USE_VERTEX", "0") == "1" else
+    "gemini-flash-latest,gemini-3.5-flash,gemini-3.8-flash,gemini-3.5-flash-lite,gemini-flash-lite-latest"
+)
+SCRIPT_MODELS = [m.strip() for m in os.getenv("SCRIPT_MODELS", _DEFAULT_SCRIPT_MODELS).split(",") if m.strip()]
+SCRIPT_TIMEOUT_SECONDS = int(os.getenv("SCRIPT_TIMEOUT_SECONDS", "50"))
+
 # AI Image Generation Model (for --use-images: still frames animated into 8s Ken Burns clips)
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-3.1-flash-image")
 
 # API Keys & Credentials
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# 1 = GEMINI_API_KEY is a Google Cloud agent platform (Vertex AI express mode) key,
+# billed through Google Cloud instead of AI Studio
+GEMINI_USE_VERTEX = os.getenv("GEMINI_USE_VERTEX", "0") == "1"
+# Needed for Veo video generation on the agent platform (project number or ID)
+GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "")
+GOOGLE_CLOUD_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+# veo-3.1-lite-generate-001 (cheapest), veo-3.1-fast-generate-001, veo-3.1-generate-001 (best)
+VEO_MODEL = os.getenv("VEO_MODEL", "veo-3.1-lite-generate-001")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
 YOUTUBE_CLIENT_SECRETS_FILE = os.getenv(
     "YOUTUBE_CLIENT_SECRETS_FILE", 

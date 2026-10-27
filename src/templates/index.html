@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Parable Tales Studio</title>
+<style>
+  :root { --bg:#faf8f4; --card:#fff; --ink:#1d1a16; --muted:#6b645a; --line:#e6e0d6; --accent:#7a4dd8; --soft:#f1ecfb; --ok:#1f8a4c; --bad:#c0392b; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16141a; --card:#201d25; --ink:#f1ede6; --muted:#a49d92; --line:#352f3d; --accent:#a580f0; --soft:#2a2433; --ok:#4cc184; --bad:#ef6f61; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:32px 16px 64px; }
+  h1 { font-size:24px; margin:0 0 4px; }
+  h2 { font-size:17px; margin:0 0 12px; display:flex; align-items:center; gap:8px; }
+  h2 .n { display:inline-grid; place-items:center; width:24px; height:24px; border-radius:50%; background:var(--accent); color:#fff; font-size:13px; }
+  p.sub { color:var(--muted); margin:0 0 24px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; margin-top:20px; }
+  .hidden { display:none !important; }
+  label { display:block; font-weight:600; font-size:14px; margin:16px 0 6px; }
+  input[type=text], select, textarea { width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--ink); font:inherit; }
+  textarea { font-size:13px; resize:vertical; min-height:84px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; } .row > div { flex:1; min-width:180px; }
+  .check { display:flex; align-items:center; gap:8px; font-weight:400; font-size:14px; margin-top:10px; }
+  .hint { color:var(--muted); font-size:13px; margin-top:6px; }
+  button { font:600 15px system-ui, sans-serif; border:0; border-radius:8px; cursor:pointer; }
+  button.primary { margin-top:20px; width:100%; padding:12px; background:var(--accent); color:#fff; font-size:16px; }
+  button.ghost { padding:6px 12px; background:var(--soft); color:var(--accent); font-size:13px; }
+  button:disabled { opacity:.5; cursor:default; }
+  .meta { color:var(--muted); font-size:14px; margin:-6px 0 12px; }
+  .toolbar { display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+  .toolbar .btns { display:flex; gap:8px; flex-wrap:wrap; }
+  .item { border:1px solid var(--line); border-radius:10px; padding:14px; margin-top:12px; display:grid; grid-template-columns:1fr 96px; gap:12px; }
+  .item h3 { margin:0 0 6px; font-size:14px; }
+  .item .narr { font-style:italic; color:var(--muted); font-size:14px; margin:0 0 10px; }
+  .item .prompt { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; font-size:13px; margin:0 0 8px; white-space:pre-wrap; word-break:break-word; }
+  .actions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px; }
+  .actions input[type=file] { display:none; }
+  .chips { display:flex; gap:6px; flex-wrap:wrap; margin:0 0 8px; }
+  .chip { font-size:12px; padding:2px 8px; border-radius:999px; background:var(--soft); color:var(--accent); }
+  .state { font-size:12px; color:var(--muted); }
+  .state.bad { color:var(--bad); }
+  .thumb { width:96px; aspect-ratio:9/16; border:1px dashed var(--line); border-radius:8px; background:var(--bg) center/cover no-repeat; display:grid; place-items:center; color:var(--muted); font-size:12px; text-align:center; overflow:hidden; padding:4px; }
+  .thumb.filled { border-style:solid; }
+  .thumb video { width:100%; height:100%; object-fit:cover; }
+  @media (max-width:480px) { .item { grid-template-columns:1fr 72px; } .thumb { width:72px; } }
+  .status { font-weight:600; }
+  .status.done { color:var(--ok); } .status.failed { color:var(--bad); }
+  pre { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:10px; font-size:12px; max-height:260px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Parable Tales Studio</h1>
+  <p class="sub">Write the script, lock in the characters, make each scene, then render the Short.</p>
+
+  <form class="card" id="scriptForm">
+    <h2><span class="n">1</span> Write the script</h2>
+    <div class="row">
+      <div style="flex:3">
+        <label for="topic">Bible story / topic</label>
+        <input type="text" id="topic" required placeholder="e.g. David vs Goliath">
+      </div>
+      <div style="flex:1; min-width:120px">
+        <label for="numScenes">Scenes</label>
+        <select id="numScenes"></select>
+      </div>
+      <div style="flex:1.4; min-width:150px">
+        <label for="style">Image style</label>
+        <select id="style">{{STYLE_OPTIONS}}</select>
+      </div>
+    </div>
+    <button class="primary" id="writeBtn" type="submit">Write script</button>
+    <div class="hint" id="scriptMsg"></div>
+  </form>
+
+  <section class="card hidden" id="charCard">
+    <div class="toolbar">
+      <h2 style="margin:0"><span class="n">2</span> Characters</h2>
+      <button type="button" class="ghost" id="allPortraits">Regenerate all</button>
+    </div>
+    <div class="hint">Each portrait is reused in every scene so the character keeps the same face and outfit. Edit a description and save to change how they look, or upload your own portrait.</div>
+    <div id="chars"></div>
+  </section>
+
+  <form class="card hidden" id="renderForm">
+    <div class="toolbar">
+      <h2 style="margin:0"><span class="n" id="scenesStep">3</span> Scenes</h2>
+      <div class="btns">
+        <button type="button" class="ghost" id="allScenes">Generate all images</button>
+        <button type="button" class="ghost" id="copyAll">Copy all prompts</button>
+      </div>
+    </div>
+    <div class="meta" id="scriptMeta"></div>
+    <div class="hint">Generate each scene image here (it uses the character portraits), or make one in another tool from its prompt and upload it. Short video clips work too.<span id="veoHint"> Tick Veo to animate a scene's image into AI video (about 1 minute per scene, billed to Google Cloud).</span></div>
+    <div id="scenes"></div>
+
+    <div class="row">
+      <div>
+        <label for="voice">Narrator voice</label>
+        <select id="voice">
+          <option value="en-US-ChristopherNeural">Christopher (US)</option>
+          <option value="en-US-GuyNeural">Guy (US)</option>
+          <option value="en-NG-AbeoNeural">Abeo (Nigeria)</option>
+          <option value="en-NG-EzinneNeural">Ezinne (Nigeria)</option>
+        </select>
+      </div>
+      <div>
+        <label for="privacy">YouTube privacy</label>
+        <select id="privacy">
+          <option value="private">Private</option>
+          <option value="unlisted">Unlisted</option>
+          <option value="public">Public</option>
+        </select>
+      </div>
+    </div>
+    <label class="check"><input type="checkbox" id="upload" checked> Upload to YouTube when finished</label>
+    <button class="primary" id="go" type="submit" disabled>Generate video</button>
+    <div class="hint" id="missing"></div>
+  </form>
+
+  <div class="card hidden" id="job">
+    <div class="status" id="status"></div>
+    <div id="links"></div>
+    <pre id="log"></pre>
+  </div>
+</main>
+<script>
+  const $ = id => document.getElementById(id);
+  const MAX = {{MAX_SCENES}};
+  const VEO = {{VEO_ENABLED}};
+  let script = null;
+  // Per scene: { source: null | "generated" | File, veo: bool }
+  let scenes = [];
+  let portraitsDone = [];
+
+  for (let i = 1; i <= MAX; i++) $("numScenes").add(new Option(i, i, false, i === 5));
+  $("privacy").value = "{{DEFAULT_PRIVACY}}";
+  if (!VEO) $("veoHint").remove();
+
+  async function copy(text, btn) {
+    try { await navigator.clipboard.writeText(text); }
+    catch { const t = document.createElement("textarea"); t.value = text; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove(); }
+    const old = btn.textContent; btn.textContent = "Copied"; setTimeout(() => btn.textContent = old, 1200);
+  }
+
+  async function post(url, data) {
+    const r = await fetch(url, { method: "POST", body: data });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.detail || r.statusText);
+    return body;
+  }
+
+  // Run async tasks with limited concurrency
+  async function pool(tasks, limit = 3) {
+    const queue = [...tasks];
+    await Promise.all(Array.from({ length: Math.min(limit, queue.length) }, async () => {
+      while (queue.length) await queue.shift()();
+    }));
+  }
+
+  function setThumb(th, content) {
+    th.innerHTML = ""; th.style.backgroundImage = ""; th.classList.remove("filled");
+    if (!content) { th.textContent = "No image yet"; return; }
+    if (typeof content === "string" && !content.startsWith("/")) { th.textContent = content; return; }
+    th.classList.add("filled");
+    if (content instanceof File && content.type.startsWith("video/")) {
+      const v = document.createElement("video");
+      v.src = URL.createObjectURL(content); v.muted = true; v.loop = true; v.autoplay = true;
+      th.appendChild(v);
+    } else {
+      th.style.backgroundImage = `url("${content instanceof File ? URL.createObjectURL(content) : content}")`;
+    }
+  }
+
+  // ---------------- Step 1: script ----------------
+  $("scriptForm").addEventListener("submit", async e => {
+    e.preventDefault();
+    $("writeBtn").disabled = true;
+    $("scriptMsg").textContent = "Writing the script… (usually under a minute)";
+    const data = new FormData();
+    data.append("topic", $("topic").value);
+    data.append("num_scenes", $("numScenes").value);
+    data.append("style", $("style").value);
+    try {
+      script = await post("/scripts", data);
+      renderCharacters();
+      renderScenes();
+      $("scriptMsg").textContent = "Not happy with it? Click again to rewrite.";
+      $("writeBtn").textContent = "Rewrite script";
+      generateAllPortraits();
+    } catch (err) {
+      $("scriptMsg").textContent = "Failed: " + err.message;
+    }
+    $("writeBtn").disabled = false;
+  });
+
+  // ---------------- Step 2: characters ----------------
+  function renderCharacters() {
+    portraitsDone = script.characters.map(() => false);
+    const box = $("chars");
+    box.innerHTML = "";
+    $("charCard").classList.toggle("hidden", script.characters.length === 0);
+    $("scenesStep").textContent = script.characters.length ? "3" : "2";
+    script.characters.forEach((c, i) => {
+      const el = document.createElement("div");
+      el.className = "item";
+      el.id = "char-" + i;
+      el.innerHTML = `
+        <div>
+          <h3></h3>
+          <textarea></textarea>
+          <div class="actions">
+            <button type="button" class="ghost save hidden">Save &amp; regenerate</button>
+            <button type="button" class="ghost regen">Regenerate</button>
+            <button type="button" class="ghost up">Upload own</button>
+            <input type="file" accept=".png,.jpg,.jpeg,.webp">
+            <span class="state"></span>
+          </div>
+        </div>
+        <div class="thumb">Waiting…</div>`;
+      el.querySelector("h3").textContent = c.name;
+      const ta = el.querySelector("textarea");
+      ta.value = c.description;
+      ta.oninput = () => el.querySelector(".save").classList.toggle("hidden", ta.value.trim() === c.description);
+      el.querySelector(".save").onclick = () => saveCharacter(i, ta.value);
+      el.querySelector(".regen").onclick = () => generatePortrait(i);
+      const fileInput = el.querySelector("input[type=file]");
+      el.querySelector(".up").onclick = () => fileInput.click();
+      fileInput.onchange = () => { if (fileInput.files[0]) generatePortrait(i, fileInput.files[0]); };
+      box.appendChild(el);
+    });
+  }
+
+  async function generatePortrait(i, file) {
+    const el = $("char-" + i);
+    const state = el.querySelector(".state");
+    const buttons = el.querySelectorAll("button");
+    buttons.forEach(b => b.disabled = true);
+    state.className = "state"; state.textContent = file ? "Uploading…" : "Generating portrait… (about 30–60s)";
+    const data = new FormData();
+    if (file) data.append("file", file, file.name);
+    try {
+      const r = await post(`/scripts/${script.id}/characters/${i}/portrait`, data);
+      setThumb(el.querySelector(".thumb"), r.url);
+      portraitsDone[i] = true;
+      state.textContent = "";
+    } catch (err) {
+      state.className = "state bad"; state.textContent = err.message;
+      if (!portraitsDone[i]) setThumb(el.querySelector(".thumb"), "No portrait");
+    }
+    buttons.forEach(b => b.disabled = false);
+    updateGo();
+  }
+
+  function generateAllPortraits() {
+    return pool(script.characters.map((_, i) => () => generatePortrait(i)));
+  }
+  $("allPortraits").onclick = generateAllPortraits;
+
+  async function saveCharacter(i, description) {
+    const data = new FormData();
+    data.append("description", description);
+    try {
+      const updated = await post(`/scripts/${script.id}/characters/${i}`, data);
+      script.characters = updated.characters;
+      // Scene prompts include character descriptions, so refresh them
+      updated.scenes.forEach((s, j) => {
+        script.scenes[j].image_prompt = s.image_prompt;
+        const p = document.querySelector(`#scene-${j} .prompt`);
+        if (p) p.textContent = s.image_prompt;
+      });
+      $("char-" + i).querySelector(".save").classList.add("hidden");
+      generatePortrait(i);
+    } catch (err) {
+      const st = $("char-" + i).querySelector(".state");
+      st.className = "state bad"; st.textContent = err.message;
+    }
+  }
+
+  // ---------------- Step 3: scenes ----------------
+  function renderScenes() {
+    scenes = script.scenes.map(() => ({ source: null, veo: false }));
+    $("scriptMeta").textContent = `${script.title} · ${script.book_chapter} · ${script.style} style`;
+    const box = $("scenes");
+    box.innerHTML = "";
+    script.scenes.forEach((s, i) => {
+      const el = document.createElement("div");
+      el.className = "item";
+      el.id = "scene-" + i;
+      el.innerHTML = `
+        <div>
+          <h3>Scene ${i + 1}</h3>
+          <p class="narr"></p>
+          <div class="chips"></div>
+          <p class="prompt"></p>
+          <div class="actions">
+            <button type="button" class="ghost gen">Generate image</button>
+            <button type="button" class="ghost up">Upload</button>
+            <button type="button" class="ghost copy">Copy prompt</button>
+            <input type="file" accept=".png,.jpg,.jpeg,.webp,.mp4,.mov,.webm,.mkv">
+            <span class="state"></span>
+          </div>
+          <label class="check veo-opt"><input type="checkbox" class="veo"> Animate with Veo (AI video from this image)</label>
+        </div>
+        <div class="thumb">No image yet</div>`;
+      el.querySelector(".narr").textContent = "“" + s.narration + "”";
+      el.querySelector(".prompt").textContent = s.image_prompt;
+      const chips = el.querySelector(".chips");
+      s.characters.forEach(n => { const c = document.createElement("span"); c.className = "chip"; c.textContent = n; chips.appendChild(c); });
+      el.querySelector(".copy").onclick = e => copy(script.scenes[i].image_prompt, e.target);
+      el.querySelector(".gen").onclick = () => generateScene(i);
+      const fileInput = el.querySelector("input[type=file]");
+      el.querySelector(".up").onclick = () => fileInput.click();
+      fileInput.onchange = () => {
+        const f = fileInput.files[0];
+        if (!f) return;
+        scenes[i].source = f;
+        setThumb(el.querySelector(".thumb"), f);
+        el.querySelector(".state").textContent = "";
+        refreshVeo(i);
+        updateGo();
+      };
+      const veoBox = el.querySelector("input.veo");
+      if (!VEO) el.querySelector(".veo-opt").remove();
+      else veoBox.onchange = () => { scenes[i].veo = veoBox.checked; };
+      refreshVeo(i, el);
+      box.appendChild(el);
+    });
+    $("renderForm").classList.remove("hidden");
+    updateGo();
+  }
+
+  // Veo animates images only; not available for uploaded video clips or empty scenes
+  function refreshVeo(i, el = $("scene-" + i)) {
+    const box = el.querySelector("input.veo");
+    if (!box) return;
+    const src = scenes[i].source;
+    const ok = src === "generated" || (src instanceof File && src.type.startsWith("image/"));
+    box.disabled = !ok;
+    if (!ok) { box.checked = false; scenes[i].veo = false; }
+  }
+
+  async function generateScene(i) {
+    const el = $("scene-" + i);
+    const state = el.querySelector(".state");
+    const missing = script.scenes[i].characters.filter(n => !portraitsDone[script.characters.findIndex(c => c.name === n)]);
+    el.querySelectorAll("button").forEach(b => b.disabled = true);
+    state.className = "state";
+    state.textContent = missing.length
+      ? `Generating… (no portrait yet for ${missing.join(", ")}, so they may look different)`
+      : "Generating scene image… (about 30–60s)";
+    try {
+      const r = await post(`/scripts/${script.id}/scenes/${i}/image`, new FormData());
+      scenes[i].source = "generated";
+      setThumb(el.querySelector(".thumb"), r.url);
+      el.querySelector(".gen").textContent = "Regenerate";
+      state.textContent = "";
+    } catch (err) {
+      state.className = "state bad"; state.textContent = err.message;
+    }
+    el.querySelectorAll("button").forEach(b => b.disabled = false);
+    refreshVeo(i);
+    updateGo();
+  }
+
+  $("allScenes").onclick = () => pool(
+    script.scenes.map((_, i) => i).filter(i => !scenes[i].source).map(i => () => generateScene(i))
+  );
+
+  $("copyAll").onclick = e => copy(
+    script.scenes.map((s, i) => `Scene ${i + 1}:\n${s.image_prompt}`).join("\n\n"), e.target);
+
+  function updateGo() {
+    const missing = scenes.map((s, i) => s.source ? null : i + 1).filter(Boolean);
+    $("go").disabled = missing.length > 0;
+    $("missing").textContent = missing.length ? `Still needed: scene ${missing.join(", ")}` : "";
+  }
+
+  // ---------------- Step 4: render ----------------
+  $("renderForm").addEventListener("submit", async e => {
+    e.preventDefault();
+    const data = new FormData();
+    data.append("script_id", script.id);
+    data.append("voice", $("voice").value);
+    data.append("privacy", $("privacy").value);
+    data.append("upload", $("upload").checked ? "true" : "false");
+    data.append("slots", scenes.map(s => s.source === "generated" ? "generated" : "file").join(","));
+    data.append("veo", scenes.map(s => s.veo ? "1" : "0").join(","));
+    scenes.forEach(s => { if (s.source instanceof File) data.append("files", s.source, s.source.name); });
+
+    $("go").disabled = true;
+    $("job").classList.remove("hidden");
+    $("links").innerHTML = "";
+    $("log").textContent = "";
+    show("Uploading…", "");
+    $("job").scrollIntoView({ behavior: "smooth" });
+    try {
+      const body = await post("/jobs", data);
+      poll(body.id);
+    } catch (err) {
+      show("Failed: " + err.message, "failed");
+      updateGo();
+    }
+  });
+
+  function show(text, cls) { $("status").textContent = text; $("status").className = "status " + cls; }
+
+  async function poll(id) {
+    let j;
+    try {
+      const r = await fetch("/jobs/" + id);
+      j = await r.json();
+      if (!r.ok) throw new Error(j.detail || r.statusText);
+    } catch (err) {
+      show("Lost track of job: " + err.message, "failed");
+      updateGo();
+      return;
+    }
+    $("log").textContent = j.log.join("\n");
+    $("log").scrollTop = $("log").scrollHeight;
+    if (j.status === "queued") show(`Queued (${j.queued_ahead} ahead)…`, "");
+    else if (j.status === "running") show("Rendering… this usually takes a few minutes (longer with Veo scenes)", "");
+    else {
+      updateGo();
+      if (j.status === "done") {
+        show("Done: " + (j.title || ""), "done");
+        let html = "";
+        if (j.youtube_url) html += `<p><a href="${j.youtube_url}" target="_blank" rel="noopener">Open on YouTube</a></p>`;
+        if (j.has_video) html += `<p><a href="/jobs/${id}/video">Download MP4</a></p>`;
+        $("links").innerHTML = html;
+      } else {
+        show("Failed: " + j.error, "failed");
+      }
+      return;
+    }
+    setTimeout(() => poll(id), 3000);
+  }
+</script>
+</body>
+</html>

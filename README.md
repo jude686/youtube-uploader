@@ -114,6 +114,39 @@ Google Flow's browser studio (`flow.google`) offers **Character Consistency ("In
 
 ---
 
+## 🧑 Character Consistency
+Characters keep the same face and outfit across scenes in three layers:
+1. **Character sheet:** the script includes a fixed description per recurring character, inserted word-for-word into every scene prompt they appear in.
+2. **Portraits:** one reference portrait per character is generated, or uploaded. Every generated scene image is made with the relevant portraits as reference images.
+3. **Veo from the image:** "Animate with Veo" turns the consistent scene image into video (image-to-video), so the clip keeps the same characters.
+
+In the Web Studio this is the **Characters** step: edit a description and "Save & regenerate", or "Upload own". On the CLI, `--use-images` and `--use-veo` generate portraits automatically.
+
+---
+
+## 🎨 Visual Styles
+Pick **3D animated** (default), **Realistic** or **Cartoon** per episode: in the Web Studio's "Image style" dropdown, or `--style realistic` on the CLI. The script's scene descriptions are written to suit the style, and every image/Veo prompt ends with that style's wording plus the closed-mouth rule. Edit the wording, or add styles, in `VISUAL_STYLES` in `config.py`. `VISUAL_STYLE` in `.env` changes the default.
+
+---
+
+## ☁️ Using a Google Cloud agent platform (Vertex AI) key
+Instead of an AI Studio key, you can use an API key from the Google Cloud agent platform (Vertex AI express mode), billed through Google Cloud. In `.env`:
+```
+GEMINI_API_KEY=<your Google Cloud API key>
+GEMINI_USE_VERTEX=1
+```
+Model availability can differ from AI Studio. If a model in `SCRIPT_MODELS` returns 404, replace it with one listed in the Cloud console's Model Garden.
+
+**Veo video generation** also needs your project number (or ID):
+```
+GOOGLE_CLOUD_PROJECT=<project number>
+GOOGLE_CLOUD_LOCATION=us-central1      # optional
+VEO_MODEL=veo-3.1-lite-generate-001    # or veo-3.1-fast-generate-001 / veo-3.1-generate-001
+```
+Then use `--use-veo` on the CLI, or tick "Generate this scene with Veo" on a scene in the Web Studio. Each clip is 8s 9:16 720p (about a minute to generate). Scenes longer than 8s loop the clip, so use more scenes for longer narrations.
+
+---
+
 ## 🖼️ Image Mode (`--use-images`)
 Generates one still per scene with Gemini Flash (`IMAGE_MODEL`, default `gemini-3.1-flash-image`) and animates it into a slow-zoom clip:
 ```bash
@@ -126,7 +159,9 @@ Scenes stretch to cover the full narration (minimum 8s each), so the voiceover i
 ---
 
 ## 🌐 Web Studio (upload scenes → video → YouTube)
-A password-protected page where you enter a topic, upload your scene images/clips in order, and the server writes a script with exactly one scene per file, records the voiceover, renders the Short and uploads it to YouTube.
+A password-protected page that works in two steps:
+1. **Write the script:** enter a topic and scene count. You get each scene's narration plus a matching image prompt (copy one or all).
+2. **Upload & generate:** make an image (or short clip) per scene from its prompt in any tool, add it to that scene, and the server records the voiceover for that same script, renders the Short and uploads it to YouTube.
 
 Run locally:
 ```bash
@@ -134,7 +169,7 @@ pip install -r requirements.txt
 set APP_PASSWORD=choose-a-password
 uvicorn src.web:app --port 8000
 ```
-Open http://localhost:8000 and log in with any username plus `APP_PASSWORD`. Files play in filename order (name them `01.png`, `02.png`, …).
+Open http://localhost:8000 and log in with any username plus `APP_PASSWORD`. The page lives in `src/templates/index.html`.
 
 ### Deploying to Northflank
 

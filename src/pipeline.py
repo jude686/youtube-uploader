@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import config
-from src.script_generator import generate_script_with_gemini
+from src.script_generator import VideoPayload, generate_script_with_gemini
 from src.voice_engine import generate_narration_audio
 from src.media_fetcher import MediaFetcher
 from src.video_composer import VideoComposer
@@ -29,12 +29,18 @@ def run_pipeline(
     voice: str = config.DEFAULT_VOICE,
     privacy: str = config.YOUTUBE_DEFAULT_PRIVACY,
     scene_assets: Optional[List[Path]] = None,
-    strict_upload: bool = False
+    strict_upload: bool = False,
+    payload: Optional[VideoPayload] = None,
+    style: str = config.DEFAULT_VISUAL_STYLE,
+    scene_veo: Optional[List[bool]] = None
 ):
     """
     scene_assets: user-provided scene images/videos in order; the script is written
                   with exactly one scene per file.
     strict_upload: raise on YouTube upload failure instead of falling back to a dry run.
+    payload: a previously generated script to render (skips script generation), e.g. one
+             whose image prompts the user already used to make the scene_assets.
+    scene_veo: per scene, True to animate that scene's image with Veo instead of a slow zoom.
     """
     start_time = time.time()
     logger.info("=" * 65)
@@ -50,8 +56,11 @@ def run_pipeline(
     # ----------------------------------------------------
     # STEP 1: SCRIPT & VISUAL PROMPT GENERATION
     # ----------------------------------------------------
-    logger.info("\n[STEP 1/5] Generating script & 8s scene prompts via Gemini 1.5 Flash...")
-    payload = generate_script_with_gemini(topic, num_scenes=len(scene_assets) if scene_assets else None)
+    if payload:
+        logger.info("\n[STEP 1/5] Using the pre-generated script...")
+    else:
+        logger.info("\n[STEP 1/5] Generating script & 8s scene prompts via Gemini Flash...")
+        payload = generate_script_with_gemini(topic, num_scenes=len(scene_assets) if scene_assets else None, style=style)
 
     logger.info(f"🏷️  Selected Title: {payload.title}")
     logger.info(f"📜 Scripture: {payload.book_chapter}")
@@ -89,12 +98,24 @@ def run_pipeline(
     # ----------------------------------------------------
     logger.info("\n[STEP 3/5] Acquiring stacked 8-second visual clips...")
     clips_dir = episode_dir / "clips"
+
+    # Character portraits keep characters consistent across generated scenes
+    portraits = {}
+    if not scene_assets and (use_images or use_veo) and payload.characters:
+        logger.info(f"🧑 Generating {len(payload.characters)} character portraits for consistency...")
+        portraits = media_fetcher.generate_character_portraits(
+            payload.characters, payload.style, episode_dir / "characters"
+        )
+
     scene_clips = media_fetcher.acquire_scene_clips(
         payload.scenes,
         clips_dir,
-        use_omni=(use_omni or use_veo),
+        use_omni=use_omni,
+        use_veo=use_veo,
         use_images=use_images,
-        scene_assets=scene_assets
+        scene_assets=scene_assets,
+        scene_veo=scene_veo,
+        portraits=portraits
     )
     logger.info(f"🎞️ Collected {len(scene_clips)} scene clips ({len(scene_clips) * scene_length:.1f}s visual bank)")
 
@@ -185,12 +206,19 @@ def main():
     parser.add_argument(
         "--use-veo",
         action="store_true",
-        help="Alias for --use-omni (Google video generation model)"
+        help=f"Generate scene clips with Veo ({config.VEO_MODEL}) on the Google Cloud agent platform"
     )
     parser.add_argument(
         "--use-images",
         action="store_true",
         help=f"Generate a still image per scene with Gemini ({config.IMAGE_MODEL}) and animate it into an 8s zoom clip"
+    )
+    parser.add_argument(
+        "--style",
+        type=str,
+        default=config.DEFAULT_VISUAL_STYLE,
+        choices=list(config.VISUAL_STYLES),
+        help="Visual style for scene prompts: 3d, realistic or cartoon"
     )
     parser.add_argument(
         "--voice",
@@ -214,6 +242,7 @@ def main():
         use_omni=args.use_omni,
         use_veo=args.use_veo,
         use_images=args.use_images,
+        style=args.style,
         voice=args.voice,
         privacy=args.privacy
     )

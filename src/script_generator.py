@@ -17,15 +17,27 @@ class ScenePrompt(BaseModel):
     )
     visual_description: str = Field(
         ...,
-        description="Raw visual description of the 3D cinematic comic scene."
+        description="Raw visual description of the scene (no art style; that is appended)."
     )
     final_visual_prompt: str = Field(
         ...,
-        description="Prompt payload with injected 3D comic and closed-mouth constraints."
+        description="Prompt payload with injected visual style and closed-mouth constraints."
     )
     b_roll_search_keyword: str = Field(
         ...,
         description="Simple search keywords for stock footage fallback."
+    )
+    characters: List[str] = Field(
+        default_factory=list,
+        description="Names of recurring characters (from VideoPayload.characters) visible in this scene."
+    )
+
+
+class Character(BaseModel):
+    name: str
+    description: str = Field(
+        ...,
+        description="Fixed visual description reused verbatim in every scene so the character stays consistent."
     )
 
 
@@ -38,9 +50,13 @@ class VideoPayload(BaseModel):
     scenes: List[ScenePrompt]
     full_narration: str
     cta_question: str
+    characters: List[Character] = Field(default_factory=list)
+    style: str = config.DEFAULT_VISUAL_STYLE
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(style: str = config.DEFAULT_VISUAL_STYLE) -> str:
+    injection = config.visual_injection(style)
+    style_label = config.VISUAL_STYLES.get(style, config.VISUAL_STYLES["3d"])["label"]
     return f"""You are the lead viral scriptwriter and creative director for '{config.BRAND_NAME}'.
 Channel Brand & Niche: {config.NICHE_DESCRIPTION}.
 
@@ -57,7 +73,7 @@ Each scene MUST correspond to exactly {config.CLIP_DURATION_SECONDS} seconds of 
 
 NARRATIVE ARC:
 1. Scene 1 - Modern, Relatable Hook: Start with high emotional stakes, dramatic tension, or modern situational comedy (e.g., dodging calls, sibling rivalry, pride before a fall).
-2. Scenes 2-4 - The Biblical Event: The scripturally accurate biblical encounter, packed with vivid 3D visual drama.
+2. Scenes 2-4 - The Biblical Event: The scripturally accurate biblical encounter, packed with vivid visual drama.
 3. Scene 5 - Practical Life Lesson: Bridge the ancient story to our daily walk with God.
 4. Scene 6 - Comment-Driving Call to Action (CTA): An open-ended question that forces viewers to debate or comment in the replies.
 
@@ -66,8 +82,18 @@ METADATA REQUIREMENTS:
    - Format A: '[Modern Hook/Curiosity] (Bible Character/Story)' (e.g., 'When You Try To Ghost God (Jonah's Story) #Shorts')
    - Format B: 'The [Adjective] [Event] in the Bible' (e.g., 'The Most Savage Disobedience in the Bible #Shorts')
 2. Tags: Must include: {json.dumps(config.BASE_TAGS)} plus the specific '[Book Chapter]' (e.g., 'Jonah 1').
-3. Visual Prompt Injection: Every scene's `final_visual_prompt` MUST end with:
-   '{config.VISUAL_PROMPT_INJECTION}'
+3. Visual Style: This episode is in {style_label} style. Write every `visual_description` so it suits that style
+   (subjects, setting, lighting, camera angle), but don't name an art style in it; the style is appended automatically.
+4. Visual Prompt Injection: Every scene's `final_visual_prompt` MUST end with:
+   '{injection}'
+
+CHARACTER CONSISTENCY:
+1. List every recurring on-screen character (people and notable creatures, max 4) in `characters`, each with a
+   fixed, specific visual `description`: age, build, skin tone, face, hair, facial hair, and exact clothing with
+   colors and accessories. No art-style words, no poses, no actions. This exact description is reused in every scene.
+2. In each scene, refer to characters by NAME only (e.g. "David grips his sling"); do not re-describe their
+   appearance, clothing or age, and never contradict the character sheet.
+3. List the names of the characters visible in each scene in that scene's `characters` array (empty if none).
 
 OUTPUT FORMAT:
 Respond with pure JSON conforming to this schema:
@@ -78,13 +104,17 @@ Respond with pure JSON conforming to this schema:
   "description": "Engaging description with emojis, brief summary, scripture reference, and hashtags",
   "tags": ["Bible animation", "3D Bible stories", ...],
   "cta_question": "Open-ended question for the comments section",
+  "characters": [
+    {{"name": "David", "description": "16-year-old shepherd boy, slim build, olive skin, curly shoulder-length black hair, ..."}}
+  ],
   "scenes": [
     {{
       "scene_number": 1,
       "duration_seconds": 8.0,
       "narration": "Narration text for this 8-second beat",
-      "visual_description": "Vivid visual description of the characters, environment, lighting",
-      "final_visual_prompt": "Visual description + ', ' + '{config.VISUAL_PROMPT_INJECTION}'",
+      "visual_description": "Vivid description of the action, environment, lighting and camera, naming characters",
+      "characters": ["David"],
+      "final_visual_prompt": "Visual description + ', ' + '{injection}'",
       "b_roll_search_keyword": "search terms for fallback b-roll (e.g. ancient storm ocean)"
     }}
   ]
@@ -172,15 +202,102 @@ def generate_fallback_script(topic: str) -> VideoPayload:
     )
 
 
-def generate_script_with_gemini(topic: str, num_scenes: Optional[int] = None) -> VideoPayload:
+class ScriptGenerationError(RuntimeError):
+    """Raised when no Gemini model could write the script (and fallback is disabled)."""
+
+
+def _parse_payload(content_text: str, style: str = config.DEFAULT_VISUAL_STYLE) -> VideoPayload:
+    data = json.loads(content_text)
+    injection = config.visual_injection(style)
+
+    characters = [
+        Character(name=c["name"].strip(), description=c["description"].strip().rstrip("."))
+        for c in data.get("characters", []) if c.get("name") and c.get("description")
+    ]
+    by_name = {c.name.lower(): c for c in characters}
+
+    # Build each final prompt as description + character sheet entries + chosen style, rather
+    # than trusting the model's final_visual_prompt (it sometimes drops or mixes the style suffix)
+    scenes: List[ScenePrompt] = []
+    for s in data.get("scenes", []):
+        description = (s.get("visual_description") or s.get("final_visual_prompt", "")).strip().rstrip(",.")
+        scene_chars = [by_name[n.strip().lower()].name for n in s.get("characters", []) if n.strip().lower() in by_name]
+        final_prompt = f"{description}. {character_block(scene_chars, characters)}{injection}"
+
+        scenes.append(
+            ScenePrompt(
+                scene_number=s.get("scene_number", len(scenes) + 1),
+                duration_seconds=config.CLIP_DURATION_SECONDS,
+                narration=s.get("narration", ""),
+                visual_description=s.get("visual_description", ""),
+                final_visual_prompt=final_prompt,
+                b_roll_search_keyword=s.get("b_roll_search_keyword", "ancient bible story"),
+                characters=scene_chars,
+            )
+        )
+    if not scenes:
+        raise ValueError("response contained no scenes")
+
+    full_narration = " ".join([sc.narration for sc in scenes])
+
+    # Ensure default tags are present
+    tags = data.get("tags", [])
+    for base_tag in config.BASE_TAGS:
+        if base_tag not in tags:
+            tags.append(base_tag)
+
+    return VideoPayload(
+        title=data.get("title", f"The Wildest Story in {data.get('book_chapter', 'The Bible')} #Shorts"),
+        title_options=data.get("title_options", [data.get("title", "")]),
+        book_chapter=data.get("book_chapter", "The Bible"),
+        description=data.get("description", ""),
+        tags=tags,
+        scenes=scenes,
+        full_narration=full_narration,
+        cta_question=data.get("cta_question", "What would you do in this situation? Let us know in the comments!"),
+        characters=characters,
+        style=style,
+    )
+
+
+def rebuild_scene_prompts(payload: "VideoPayload") -> None:
+    """Re-derives every scene's final prompt, e.g. after a character description is edited."""
+    injection = config.visual_injection(payload.style)
+    for sc in payload.scenes:
+        description = sc.visual_description.strip().rstrip(",.")
+        sc.final_visual_prompt = f"{description}. {character_block(sc.characters, payload.characters)}{injection}"
+
+
+def character_block(names: List[str], characters: List["Character"]) -> str:
+    """Verbatim character-sheet text for the characters in a scene (empty if none)."""
+    by_name = {c.name: c for c in characters}
+    parts = [f"{n}: {by_name[n].description}" for n in names if n in by_name]
+    return ("Characters: " + "; ".join(parts) + ". ") if parts else ""
+
+
+def generate_script_with_gemini(
+    topic: str,
+    num_scenes: Optional[int] = None,
+    allow_fallback: bool = True,
+    style: str = config.DEFAULT_VISUAL_STYLE
+) -> VideoPayload:
     """
     Calls Gemini Flash to generate a Parable Tales video script and prompt payload.
     num_scenes forces an exact scene count (e.g. to match user-uploaded scene media).
+    style is a key of config.VISUAL_STYLES (3d, realistic, cartoon).
+    Tries each model in config.SCRIPT_MODELS in turn (free-tier models are often
+    rate-limited or overloaded). If all fail: returns the built-in Jonah script when
+    allow_fallback is True, otherwise raises ScriptGenerationError.
     """
+    def fail(reason: str) -> VideoPayload:
+        if not allow_fallback:
+            raise ScriptGenerationError(reason)
+        logger.warning(f"{reason} Using the built-in Jonah fallback script (topic '{topic}' ignored).")
+        return generate_fallback_script(topic)
+
     api_key = config.GEMINI_API_KEY
     if not api_key:
-        logger.warning("GEMINI_API_KEY not found in environment. Using rich Parable Tales fallback.")
-        return generate_fallback_script(topic)
+        return fail("GEMINI_API_KEY is not set.")
 
     scene_rule = (
         f"Exactly {num_scenes} scenes (this overrides the 4 to 6 rule; compress or expand the narrative arc to fit)"
@@ -189,84 +306,40 @@ def generate_script_with_gemini(topic: str, num_scenes: Optional[int] = None) ->
     user_prompt = f"""Generate a Parable Tales episode for the topic/story: '{topic}'.
 Remember:
 - Pacing: {scene_rule}, each strictly {config.CLIP_DURATION_SECONDS} seconds long.
-- Visual injection: Append '{config.VISUAL_PROMPT_INJECTION}' to all scene prompts.
+- Visual style: {config.VISUAL_STYLES.get(style, config.VISUAL_STYLES['3d'])['label']}. Append '{config.visual_injection(style)}' to all scene prompts.
 - Mouths must be closed, no character lip-syncing!
 - Return strictly valid JSON conforming to the schema."""
 
-    # Try modern google-genai SDK first
-    try:
-        from google import genai
-        from google.genai import types
+    from google.genai import types
+    from src.genai_client import make_client
 
-        client = genai.Client(api_key=api_key)
-        # Target the recommended gemini-3.8-flash with fallback to gemini-flash-latest
-        target_model = "gemini-3.8-flash"
+    # One attempt per model with a per-call timeout: on 429/503/timeouts it's faster
+    # to move to the next model than to let the SDK keep retrying the same one
+    client = make_client(
+        http_options=types.HttpOptions(
+            timeout=config.SCRIPT_TIMEOUT_SECONDS * 1000,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
+
+    errors = []
+    for model in config.SCRIPT_MODELS:
         try:
+            logger.info(f"Writing script with {model}...")
             response = client.models.generate_content(
-                model=target_model,
-                contents=[build_system_prompt(), user_prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json"
-                )
+                model=model,
+                contents=[build_system_prompt(style), user_prompt],
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
             )
-        except Exception:
-            target_model = "gemini-flash-latest"
-            response = client.models.generate_content(
-                model=target_model,
-                contents=[build_system_prompt(), user_prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json"
-                )
-            )
-        content_text = response.text
-    except Exception as e:
-        logger.error(f"Failed to generate script via Gemini API: {e}. Falling back to default.")
-        return generate_fallback_script(topic)
+            payload = _parse_payload(response.text, style)
+            logger.info(f"Script written by {model}")
+            return payload
+        except Exception as e:
+            short = str(e).split(". {")[0][:160]
+            logger.warning(f"{model} failed: {short}")
+            errors.append(f"{model}: {short}")
 
-    try:
-        data = json.loads(content_text)
-        
-        # Verify prompt injection and formatting
-        scenes: List[ScenePrompt] = []
-        for s in data.get("scenes", []):
-            raw_prompt = s.get("final_visual_prompt", s.get("visual_description", ""))
-            if config.VISUAL_PROMPT_INJECTION not in raw_prompt:
-                final_prompt = f"{raw_prompt.rstrip(', ')}, {config.VISUAL_PROMPT_INJECTION}"
-            else:
-                final_prompt = raw_prompt
-
-            scenes.append(
-                ScenePrompt(
-                    scene_number=s.get("scene_number", len(scenes) + 1),
-                    duration_seconds=config.CLIP_DURATION_SECONDS,
-                    narration=s.get("narration", ""),
-                    visual_description=s.get("visual_description", ""),
-                    final_visual_prompt=final_prompt,
-                    b_roll_search_keyword=s.get("b_roll_search_keyword", "ancient bible story")
-                )
-            )
-
-        full_narration = " ".join([sc.narration for sc in scenes])
-        
-        # Ensure default tags are present
-        tags = data.get("tags", [])
-        for base_tag in config.BASE_TAGS:
-            if base_tag not in tags:
-                tags.append(base_tag)
-
-        return VideoPayload(
-            title=data.get("title", f"The Wildest Story in {data.get('book_chapter', 'The Bible')} #Shorts"),
-            title_options=data.get("title_options", [data.get("title", "")]),
-            book_chapter=data.get("book_chapter", "The Bible"),
-            description=data.get("description", ""),
-            tags=tags,
-            scenes=scenes,
-            full_narration=full_narration,
-            cta_question=data.get("cta_question", "What would you do in this situation? Let us know in the comments!")
-        )
-    except Exception as parse_err:
-        logger.error(f"Error parsing Gemini response JSON: {parse_err}. Raw text:\n{content_text}")
-        return generate_fallback_script(topic)
+    return fail("Every Gemini model failed (" + "; ".join(errors) + ").")
 
 
 if __name__ == "__main__":

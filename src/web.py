@@ -1,8 +1,9 @@
 """
-Parable Tales web uploader.
+Parable Tales web studio.
 
-Upload ordered scene images/clips + a topic; the server writes the script, records the
-voiceover, renders the Short and (optionally) uploads it to YouTube.
+1. Write the script (with a character sheet) for a topic.
+2. Make character portraits, then scene images that reuse them (or upload your own).
+3. Render: voiceover, slow-zoom or Veo-animated scenes, subtitles, optional YouTube upload.
 
 Run locally:  uvicorn src.web:app --port 8000
 """
@@ -18,24 +19,33 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 import config
-from src.media_fetcher import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
+from src.media_fetcher import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MediaFetcher
 from src.pipeline import run_pipeline
+from src.script_generator import (
+    ScenePrompt, ScriptGenerationError, VideoPayload, generate_script_with_gemini, rebuild_scene_prompts
+)
 
 logger = logging.getLogger("ParableTales.Web")
 
 UPLOADS_DIR = config.OUTPUT_DIR / "uploads"
+SCRIPTS_DIR = config.OUTPUT_DIR / "scripts"
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # per file
 MAX_LOG_LINES = 200
+INDEX_HTML = (Path(__file__).parent / "templates" / "index.html").read_text(encoding="utf-8")
 
 app = FastAPI(title="Parable Tales")
 security = HTTPBasic()
 
-# In-memory job store: one instance, one render at a time. Jobs are lost on restart.
+# In-memory stores: one instance, one render at a time. Both are lost on restart.
 jobs: Dict[str, dict] = {}
+# script_id -> {"topic", "style", "payload" (VideoPayload dict), "dir",
+#               "portraits": {char index: path}, "scene_images": {scene index: path}}
+scripts: Dict[str, dict] = {}
 job_queue: "queue.Queue[str]" = queue.Queue()
 
 
@@ -82,7 +92,10 @@ def worker():
                 voice=job["voice"],
                 privacy=job["privacy"],
                 scene_assets=[Path(p) for p in job["files"]],
+                scene_veo=job.get("veo"),
                 strict_upload=True,
+                # Fresh copy each run: the pipeline adjusts scene durations in place
+                payload=VideoPayload(**job["payload"]) if job.get("payload") else None,
             )
             job["video_path"] = result["video_path"]
             job["title"] = result["payload"]["title"]
@@ -113,49 +126,216 @@ def healthz():
 
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_password)])
 def index():
-    return INDEX_HTML.replace("{{MAX_SCENES}}", str(config.MAX_SCENES)).replace(
-        "{{DEFAULT_PRIVACY}}", config.YOUTUBE_DEFAULT_PRIVACY
+    veo_enabled = config.GEMINI_USE_VERTEX and bool(config.GOOGLE_CLOUD_PROJECT)
+    return (
+        INDEX_HTML.replace("{{MAX_SCENES}}", str(config.MAX_SCENES))
+        .replace("{{DEFAULT_PRIVACY}}", config.YOUTUBE_DEFAULT_PRIVACY)
+        .replace("{{VEO_ENABLED}}", "true" if veo_enabled else "false")
+        .replace("{{STYLE_OPTIONS}}", "".join(
+            f'<option value="{key}"{" selected" if key == config.DEFAULT_VISUAL_STYLE else ""}>{s["label"]}</option>'
+            for key, s in config.VISUAL_STYLES.items()
+        ))
     )
+
+
+def image_prompt(scene: ScenePrompt) -> str:
+    """Scene prompt adapted for image generators (Gemini, Midjourney, Flow, etc.)."""
+    return f"Vertical 9:16 portrait image. {scene.final_visual_prompt}"
+
+
+@app.post("/scripts", dependencies=[Depends(require_password)])
+def create_script(topic: str = Form(...), num_scenes: int = Form(5), style: str = Form(config.DEFAULT_VISUAL_STYLE)):
+    """Writes the script first so the user can make scene images from its prompts."""
+    topic = topic.strip()
+    if not topic:
+        raise HTTPException(400, "Topic is required")
+    if not 1 <= num_scenes <= config.MAX_SCENES:
+        raise HTTPException(400, f"Choose between 1 and {config.MAX_SCENES} scenes")
+    if style not in config.VISUAL_STYLES:
+        raise HTTPException(400, "Unknown visual style")
+
+    try:
+        payload = generate_script_with_gemini(topic, num_scenes=num_scenes, allow_fallback=False, style=style)
+    except ScriptGenerationError as e:
+        raise HTTPException(503, f"Couldn't write the script right now, try again in a minute. {e}")
+    script_id = uuid.uuid4().hex[:12]
+    scripts[script_id] = {
+        "topic": topic, "style": style, "payload": payload.model_dump(),
+        "dir": SCRIPTS_DIR / script_id, "portraits": {}, "scene_images": {},
+    }
+    return script_view(script_id)
+
+
+def script_view(script_id: str) -> dict:
+    script = scripts[script_id]
+    payload = VideoPayload(**script["payload"])
+    return {
+        "id": script_id,
+        "title": payload.title,
+        "book_chapter": payload.book_chapter,
+        "cta_question": payload.cta_question,
+        "style": config.VISUAL_STYLES[payload.style]["label"],
+        "characters": [{"name": c.name, "description": c.description} for c in payload.characters],
+        "scenes": [
+            {"number": s.scene_number, "narration": s.narration, "image_prompt": image_prompt(s),
+             "characters": s.characters}
+            for s in payload.scenes
+        ],
+    }
+
+
+def get_script(script_id: str) -> dict:
+    script = scripts.get(script_id)
+    if not script:
+        raise HTTPException(404, "Script not found (the server may have restarted). Write it again.")
+    return script
+
+
+def file_url(kind: str, script_id: str, index: int) -> str:
+    # Cache-buster so the page shows a regenerated image
+    return f"/scripts/{script_id}/{kind}/{index}?v={int(time.time() * 1000)}"
+
+
+async def save_upload(f: UploadFile, dest_stem: Path, allowed: set) -> Path:
+    suffix = Path(f.filename or "").suffix.lower()
+    if suffix not in allowed:
+        raise HTTPException(400, f"Unsupported file type: {f.filename}")
+    dest = dest_stem.with_suffix(suffix)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    size = 0
+    with open(dest, "wb") as out:
+        while chunk := await f.read(1024 * 1024):
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                out.close()
+                dest.unlink(missing_ok=True)
+                raise HTTPException(413, f"{f.filename} is larger than 200MB")
+            out.write(chunk)
+    return dest
+
+
+@app.post("/scripts/{script_id}/characters/{index}", dependencies=[Depends(require_password)])
+def update_character(script_id: str, index: int, description: str = Form(...)):
+    """Edits a character's fixed description; every scene prompt that includes them is rebuilt."""
+    script = get_script(script_id)
+    payload = VideoPayload(**script["payload"])
+    if not 0 <= index < len(payload.characters):
+        raise HTTPException(404, "No such character")
+    payload.characters[index].description = description.strip().rstrip(".")
+    rebuild_scene_prompts(payload)
+    script["payload"] = payload.model_dump()
+    return script_view(script_id)
+
+
+@app.post("/scripts/{script_id}/characters/{index}/portrait", dependencies=[Depends(require_password)])
+async def make_portrait(script_id: str, index: int, file: Optional[UploadFile] = File(None)):
+    """Generates a character portrait, or stores an uploaded one."""
+    script = get_script(script_id)
+    payload = VideoPayload(**script["payload"])
+    if not 0 <= index < len(payload.characters):
+        raise HTTPException(404, "No such character")
+    stem = script["dir"] / "characters" / f"character_{index + 1:02d}_{uuid.uuid4().hex[:6]}"
+    if file is not None and file.filename:
+        path = await save_upload(file, stem, IMAGE_EXTENSIONS)
+    else:
+        path = stem.with_suffix(".png")
+        ok = await run_in_threadpool(
+            MediaFetcher().generate_character_portrait, payload.characters[index], payload.style, path
+        )
+        if not ok:
+            raise HTTPException(502, "The image model didn't return a portrait. Try again.")
+    script["portraits"][index] = str(path)
+    return {"url": file_url("characters", script_id, index)}
+
+
+@app.post("/scripts/{script_id}/scenes/{index}/image", dependencies=[Depends(require_password)])
+def make_scene_image(script_id: str, index: int):
+    """Generates a scene image that reuses the character portraits as references."""
+    script = get_script(script_id)
+    payload = VideoPayload(**script["payload"])
+    if not 0 <= index < len(payload.scenes):
+        raise HTTPException(404, "No such scene")
+    portraits = {
+        payload.characters[i].name: Path(p) for i, p in script["portraits"].items() if i < len(payload.characters)
+    }
+    path = script["dir"] / "scenes" / f"scene_{index + 1:02d}_{uuid.uuid4().hex[:6]}.png"
+    if not MediaFetcher().generate_scene_image(payload.scenes[index], path, portraits):
+        raise HTTPException(502, "The image model didn't return an image. Try again.")
+    script["scene_images"][index] = str(path)
+    return {"url": file_url("scenes", script_id, index)}
+
+
+@app.get("/scripts/{script_id}/{kind}/{index}", dependencies=[Depends(require_password)])
+def get_script_file(script_id: str, kind: str, index: int):
+    script = get_script(script_id)
+    store = {"characters": script["portraits"], "scenes": script["scene_images"]}.get(kind)
+    if store is None or index not in store:
+        raise HTTPException(404, "Not generated yet")
+    return FileResponse(store[index])
 
 
 @app.post("/jobs", dependencies=[Depends(require_password)])
 async def create_job(
-    topic: str = Form(...),
+    topic: str = Form(""),
+    script_id: str = Form(""),
     voice: str = Form(config.DEFAULT_VOICE),
     privacy: str = Form(config.YOUTUBE_DEFAULT_PRIVACY),
     upload: bool = Form(False),
-    files: List[UploadFile] = File(...),
+    # Comma-separated, one per scene: "file" (next uploaded file) or "generated" (the
+    # scene image made on the page)
+    slots: str = Form(""),
+    # Comma-separated 1/0 per scene: animate that scene's image with Veo
+    veo: str = Form(""),
+    files: List[UploadFile] = File(default=[]),
 ):
+    script = get_script(script_id) if script_id else None
+    if script:
+        topic = script["topic"]
+
+    slot_list = [x.strip() for x in slots.split(",") if x.strip()] or ["file"] * len(files)
+    if any(x not in ("file", "generated") for x in slot_list) or slot_list.count("file") != len(files):
+        raise HTTPException(400, "Scene slots don't match the uploaded files")
+    if script and len(slot_list) != len(script["payload"]["scenes"]):
+        raise HTTPException(400, f"Give every scene an image ({len(script['payload']['scenes'])} scenes)")
+    if "generated" in slot_list and not script:
+        raise HTTPException(400, "Generated scene images need a written script")
+    veo_list = [x.strip() == "1" for x in veo.split(",")] if veo.strip() else [False] * len(slot_list)
+    if len(veo_list) != len(slot_list):
+        raise HTTPException(400, "Veo choices don't match the scenes")
+    if any(veo_list) and not (config.GEMINI_USE_VERTEX and config.GOOGLE_CLOUD_PROJECT):
+        raise HTTPException(400, "Veo needs GEMINI_USE_VERTEX=1 and GOOGLE_CLOUD_PROJECT on the server")
+
     topic = topic.strip()
     if not topic:
         raise HTTPException(400, "Topic is required")
     if privacy not in ("private", "unlisted", "public"):
         raise HTTPException(400, "Invalid privacy setting")
-    if not 1 <= len(files) <= config.MAX_SCENES:
-        raise HTTPException(400, f"Upload between 1 and {config.MAX_SCENES} scene files")
-
-    allowed = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
-    for f in files:
-        if Path(f.filename or "").suffix.lower() not in allowed:
-            raise HTTPException(400, f"Unsupported file type: {f.filename}")
+    if not 1 <= len(slot_list) <= config.MAX_SCENES:
+        raise HTTPException(400, f"Use between 1 and {config.MAX_SCENES} scenes")
 
     job_id = uuid.uuid4().hex[:12]
     job_dir = UPLOADS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    # Scenes play in the order the files were sent (the page sends them sorted by name)
-    saved = []
-    for i, f in enumerate(files, start=1):
-        dest = job_dir / f"scene_{i:02d}{Path(f.filename).suffix.lower()}"
-        size = 0
-        with open(dest, "wb") as out:
-            while chunk := await f.read(1024 * 1024):
-                size += len(chunk)
-                if size > MAX_UPLOAD_BYTES:
-                    shutil.rmtree(job_dir, ignore_errors=True)
-                    raise HTTPException(413, f"{f.filename} is larger than 200MB")
-                out.write(chunk)
-        saved.append(str(dest))
+    # One path per scene, in order. Generated images are copied so regenerating on the page
+    # doesn't change a queued job.
+    saved: List[str] = []
+    file_iter = iter(files)
+    try:
+        for i, slot in enumerate(slot_list):
+            stem = job_dir / f"scene_{i + 1:02d}"
+            if slot == "generated":
+                src = script["scene_images"].get(i)
+                if not src or not Path(src).exists():
+                    raise HTTPException(400, f"Scene {i + 1} has no generated image yet")
+                dest = stem.with_suffix(Path(src).suffix)
+                shutil.copy(src, dest)
+            else:
+                dest = await save_upload(next(file_iter), stem, IMAGE_EXTENSIONS | VIDEO_EXTENSIONS)
+            saved.append(str(dest))
+    except HTTPException:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
 
     jobs[job_id] = {
         "id": job_id,
@@ -165,6 +345,8 @@ async def create_job(
         "privacy": privacy,
         "upload": upload,
         "files": saved,
+        "veo": veo_list,
+        "payload": script["payload"] if script else None,
         "created": time.time(),
         "log": [],
     }
@@ -196,159 +378,3 @@ def get_video(job_id: str):
     if not job or not job.get("video_path") or not Path(job["video_path"]).exists():
         raise HTTPException(404, "Video not available")
     return FileResponse(job["video_path"], media_type="video/mp4", filename=f"parable_tales_{job_id}.mp4")
-
-
-INDEX_HTML = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Parable Tales Studio</title>
-<style>
-  :root { --bg:#faf8f4; --card:#fff; --ink:#1d1a16; --muted:#6b645a; --line:#e6e0d6; --accent:#7a4dd8; --ok:#1f8a4c; --bad:#c0392b; }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg:#16141a; --card:#201d25; --ink:#f1ede6; --muted:#a49d92; --line:#352f3d; --accent:#a580f0; --ok:#4cc184; --bad:#ef6f61; }
-  }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }
-  main { max-width:640px; margin:0 auto; padding:32px 16px 64px; }
-  h1 { font-size:24px; margin:0 0 4px; }
-  p.sub { color:var(--muted); margin:0 0 24px; }
-  form, .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; }
-  label { display:block; font-weight:600; font-size:14px; margin:16px 0 6px; }
-  label:first-child { margin-top:0; }
-  input[type=text], select { width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--ink); font:inherit; }
-  input[type=file] { width:100%; }
-  .row { display:flex; gap:12px; } .row > div { flex:1; min-width:0; }
-  .check { display:flex; align-items:center; gap:8px; font-weight:400; margin-top:16px; }
-  .hint { color:var(--muted); font-size:13px; margin-top:6px; }
-  ol#preview { margin:10px 0 0; padding-left:22px; font-size:14px; color:var(--muted); }
-  button { margin-top:20px; width:100%; padding:12px; border:0; border-radius:8px; background:var(--accent); color:#fff; font:600 16px system-ui, sans-serif; cursor:pointer; }
-  button:disabled { opacity:.5; cursor:default; }
-  .card { margin-top:20px; display:none; }
-  .status { font-weight:600; }
-  .status.done { color:var(--ok); } .status.failed { color:var(--bad); }
-  pre { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:10px; font-size:12px; max-height:260px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
-  a { color:var(--accent); }
-</style>
-</head>
-<body>
-<main>
-  <h1>Parable Tales Studio</h1>
-  <p class="sub">Upload your scenes in order. The script, voiceover, subtitles and render are done for you.</p>
-
-  <form id="f">
-    <label for="topic">Bible story / topic</label>
-    <input type="text" id="topic" name="topic" required placeholder="e.g. David vs Goliath">
-
-    <label for="files">Scene images or clips</label>
-    <input type="file" id="files" name="files" multiple required accept=".png,.jpg,.jpeg,.webp,.mp4,.mov,.webm,.mkv">
-    <div class="hint">Up to {{MAX_SCENES}} files, each about 8 seconds of the video. Played in filename order, so name them 01, 02, 03&hellip;</div>
-    <ol id="preview"></ol>
-
-    <div class="row">
-      <div>
-        <label for="voice">Narrator voice</label>
-        <select id="voice" name="voice">
-          <option value="en-US-ChristopherNeural">Christopher (US)</option>
-          <option value="en-US-GuyNeural">Guy (US)</option>
-          <option value="en-NG-AbeoNeural">Abeo (Nigeria)</option>
-          <option value="en-NG-EzinneNeural">Ezinne (Nigeria)</option>
-        </select>
-      </div>
-      <div>
-        <label for="privacy">YouTube privacy</label>
-        <select id="privacy" name="privacy">
-          <option value="private">Private</option>
-          <option value="unlisted">Unlisted</option>
-          <option value="public">Public</option>
-        </select>
-      </div>
-    </div>
-
-    <label class="check"><input type="checkbox" id="upload" name="upload" value="true" checked> Upload to YouTube when finished</label>
-    <button id="go" type="submit">Generate video</button>
-  </form>
-
-  <div class="card" id="job">
-    <div class="status" id="status"></div>
-    <div id="links"></div>
-    <pre id="log"></pre>
-  </div>
-</main>
-<script>
-  const $ = id => document.getElementById(id);
-  $("privacy").value = "{{DEFAULT_PRIVACY}}";
-  const sortedFiles = () => [...$("files").files].sort((a, b) => a.name.localeCompare(b.name, undefined, {numeric: true}));
-
-  $("files").addEventListener("change", () => {
-    $("preview").innerHTML = "";
-    for (const f of sortedFiles()) {
-      const li = document.createElement("li");
-      li.textContent = f.name;
-      $("preview").appendChild(li);
-    }
-  });
-
-  $("f").addEventListener("submit", async e => {
-    e.preventDefault();
-    const data = new FormData();
-    data.append("topic", $("topic").value);
-    data.append("voice", $("voice").value);
-    data.append("privacy", $("privacy").value);
-    data.append("upload", $("upload").checked ? "true" : "false");
-    for (const f of sortedFiles()) data.append("files", f, f.name);
-
-    $("go").disabled = true;
-    $("job").style.display = "block";
-    $("links").innerHTML = "";
-    $("log").textContent = "";
-    show("Uploading files…", "");
-    try {
-      const r = await fetch("/jobs", { method: "POST", body: data });
-      const body = await r.json();
-      if (!r.ok) throw new Error(body.detail || r.statusText);
-      poll(body.id);
-    } catch (err) {
-      show("Failed: " + err.message, "failed");
-      $("go").disabled = false;
-    }
-  });
-
-  function show(text, cls) { $("status").textContent = text; $("status").className = "status " + cls; }
-
-  async function poll(id) {
-    let j;
-    try {
-      const r = await fetch("/jobs/" + id);
-      j = await r.json();
-      if (!r.ok) throw new Error(j.detail || r.statusText);
-    } catch (err) {
-      show("Lost track of job: " + err.message, "failed");
-      $("go").disabled = false;
-      return;
-    }
-    $("log").textContent = j.log.join("\\n");
-    $("log").scrollTop = $("log").scrollHeight;
-    if (j.status === "queued") show(`Queued (${j.queued_ahead} ahead)…`, "");
-    else if (j.status === "running") show("Rendering… this usually takes a few minutes", "");
-    else {
-      $("go").disabled = false;
-      if (j.status === "done") {
-        show("Done: " + (j.title || ""), "done");
-        let html = "";
-        if (j.youtube_url) html += `<p><a href="${j.youtube_url}" target="_blank" rel="noopener">Open on YouTube</a></p>`;
-        if (j.has_video) html += `<p><a href="/jobs/${id}/video">Download MP4</a></p>`;
-        $("links").innerHTML = html;
-      } else {
-        show("Failed: " + j.error, "failed");
-        if (j.has_video) $("links").innerHTML = `<p><a href="/jobs/${id}/video">Download the rendered MP4</a></p>`;
-      }
-      return;
-    }
-    setTimeout(() => poll(id), 3000);
-  }
-</script>
-</body>
-</html>
-"""
